@@ -1,0 +1,16 @@
+{
+  "name": "@equin/pg-client-darwin-x64",
+  "version": "18.3.0",
+  "description": "PostgreSQL client tools (pg_dump, pg_restore) for macOS x64, libpq statically linked",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["native/bin/pg_dump", "native/bin/pg_restore"],
+  "license": "PostgreSQL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/equinai/pg-client-embedded.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

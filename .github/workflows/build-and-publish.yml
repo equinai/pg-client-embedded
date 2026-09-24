@@ -1,0 +1,145 @@
+name: Build and Publish
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'npm package version to publish (e.g. 18.3.0)'
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # The server these clients must match, fetched for the smoke test. Its
+  # Postgres version must equal PG_VERSION in scripts/build.sh — the smoke test
+  # fails otherwise.
+  EMBEDDED_POSTGRES_VERSION: 18.3.0-beta.17
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-latest
+          - platform: darwin-x64
+            runner: macos-latest
+            arch: x86_64
+          # 22.04 on purpose: glibc stays dynamic, so the build host's glibc
+          # is the oldest one the binaries run on.
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config curl bzip2 zlib1g-dev
+
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.arch }}" ]; then
+            arch -${{ matrix.arch }} bash scripts/build.sh
+          else
+            bash scripts/build.sh
+          fi
+
+      - name: Fetch the matching embedded-postgres server
+        run: |
+          # --force: darwin-x64 is fetched on an arm64 runner (run under Rosetta).
+          npm install --no-save --force --prefix .smoke \
+            "@embedded-postgres/${{ matrix.platform }}@${EMBEDDED_POSTGRES_VERSION}"
+
+      - name: Smoke test (dump → restore against the server)
+        run: |
+          SERVER=".smoke/node_modules/@embedded-postgres/${{ matrix.platform }}"
+          if [ -n "${{ matrix.arch }}" ]; then
+            arch -${{ matrix.arch }} bash scripts/smoke-test.sh "$SERVER"
+          else
+            bash scripts/smoke-test.sh "$SERVER"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: pg-client-${{ matrix.platform }}
+          path: packages/${{ matrix.platform }}/native/bin/
+          retention-days: 7
+
+  publish:
+    name: Publish npm packages
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts/
+
+      - name: Stage binaries and set versions
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            mkdir -p "packages/${platform}/native/bin"
+            for tool in pg_dump pg_restore; do
+              cp "artifacts/pg-client-${platform}/${tool}" "packages/${platform}/native/bin/${tool}"
+              chmod 755 "packages/${platform}/native/bin/${tool}"
+            done
+            node -e "
+              const fs = require('fs');
+              const p = 'packages/${platform}/package.json';
+              const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
+              pkg.version = '${VERSION}';
+              fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
+            "
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            echo "==> Publishing @equin/pg-client-${platform}"
+            (cd "packages/${platform}" && npm publish --provenance --access public)
+          done
