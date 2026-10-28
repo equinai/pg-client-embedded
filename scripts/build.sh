@@ -6,9 +6,19 @@
 # Output: packages/<platform>/native/bin/{pg_dump,pg_restore}
 set -euo pipefail
 
-PG_VERSION="18.3"
-PG_SHA256="d95663fbbf3a80f81a9d98d895266bdcb74ba274bcc04ef6d76630a72dee016f"
+# The PostgreSQL release to build, <major>.<minor> (e.g. 18.4). Required: the
+# workflow derives it from the @embedded-postgres server the clients must match,
+# so the two cannot disagree. Locally: PG_VERSION=18.4 bash scripts/build.sh
+PG_VERSION="${PG_VERSION:?PG_VERSION is required (e.g. PG_VERSION=18.4)}"
+if ! [[ "${PG_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  echo "ERROR: PG_VERSION must be <major>.<minor>, got '${PG_VERSION}'"; exit 1
+fi
 PG_URL="https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2"
+# The release's published checksum (served beside the tarball, over HTTPS).
+PG_SHA256="$(curl -fsSL "${PG_URL}.sha256" | awk '{print $1}')"
+if ! [[ "${PG_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "ERROR: no valid checksum at ${PG_URL}.sha256 (got '${PG_SHA256}')"; exit 1
+fi
 
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 case "$(uname -m)" in

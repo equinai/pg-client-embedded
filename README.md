@@ -34,9 +34,14 @@ The package version is the PostgreSQL version: `18.3.0` = PostgreSQL 18.3, which
 
 ## Publishing a new release
 
-1. Bump `PG_VERSION` and `PG_SHA256` in `scripts/build.sh` (checksum from `https://ftp.postgresql.org/pub/source/v<ver>/postgresql-<ver>.tar.bz2.sha256`).
-2. Bump `EMBEDDED_POSTGRES_VERSION` in the workflow to the server release with the same Postgres version.
-3. Commit and push. CI builds and smoke-tests without publishing.
-4. Tag and push: `git tag v<ver>.0 && git push origin v<ver>.0`. CI publishes all 4 packages.
+**Automatic, nothing to do.** The *Build and Publish* workflow runs daily. Its `resolve` job takes the newest `@embedded-postgres/linux-x64` release (by version, e.g. `18.4.0-beta.17`), derives the PostgreSQL release from it (`18.4`) and the package version (`18.4.0`). If `@equin/pg-client-*@18.4.0` is not on npm yet, it builds and smoke-tests all 4 platforms against that server, publishes them, and pushes the tag `v18.4.0`. If it is already published, the run stops after `resolve`. Nothing in the repo pins a version: `scripts/build.sh` takes `PG_VERSION` from the environment (required) and fetches the release's checksum beside the tarball.
+
+**Manual:** run the workflow (Actions → Build and Publish → Run workflow) with a version, e.g. `18.4.1` for a rebuild of PostgreSQL 18.4 or `17.10.0` for an older major. The PostgreSQL release is its `major.minor`, the server is the newest `@embedded-postgres` release of it (the run fails if there is none). Pushing a tag `v<version>` does the same.
+
+A version already on npm is never published again: the run (and each package within it) is a no-op, so a failed run can simply be re-run. Pushes to `main` and pull requests resolve the newest server and build + smoke-test, but never publish.
+
+GitHub disables scheduled workflows on a repository with no activity for 60 days; re-enable it with `gh workflow enable "Build and Publish" -R equinai/pg-client-embedded`.
 
 Publishing needs an `NPM_TOKEN` repo secret with publish access to the `@equin` npm scope.
+
+To build locally: `PG_VERSION=18.4 bash scripts/build.sh`.

@@ -1,27 +1,129 @@
 name: Build and Publish
 
+# Publishes @equin/pg-client-* for every new @embedded-postgres release, with no
+# human step: a daily run resolves the newest server release, and publishes the
+# matching <major>.<minor>.0 clients if npm does not have them yet.
+#
+#   schedule          newest server; build + publish only if not on npm yet
+#   workflow_dispatch the given version (server: newest with its major.minor); publish if not on npm
+#   push tag v*       same, version from the tag
+#   push main / PR    newest server; build + smoke test, never publish
+
 on:
   push:
     branches: [main]
     tags:
       - 'v*'
   pull_request:
+  schedule:
+    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       version:
-        description: 'npm package version to publish (e.g. 18.3.0)'
+        description: 'npm package version to publish (e.g. 18.4.0); its major.minor is the PostgreSQL release'
         required: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # The server these clients must match, fetched for the smoke test. Its
-  # Postgres version must equal PG_VERSION in scripts/build.sh — the smoke test
-  # fails otherwise.
-  EMBEDDED_POSTGRES_VERSION: 18.3.0-beta.17
 
 jobs:
+  resolve:
+    name: Resolve versions
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      pg_version: ${{ steps.resolve.outputs.pg_version }}
+      embedded_postgres_version: ${{ steps.resolve.outputs.embedded_postgres_version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Resolve
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          SERVER_PKG="@embedded-postgres/linux-x64"
+          SERVER_RE='^([0-9]+)\.([0-9]+)\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+          # Every published server release, sorted oldest → newest by version.
+          # (Not the `latest` dist-tag: a backport published after the newest
+          # major would move it backwards.)
+          all_servers() {
+            npm view "${SERVER_PKG}" versions --json \
+              | node -e 'for (const x of [].concat(JSON.parse(require("fs").readFileSync(0, "utf8")))) console.log(x)' \
+              | sort -V
+          }
+
+          # Whether <pkg>@<version> is on npm. Reads the package's version list:
+          # `npm view <pkg>@<missing> version` exits 1 (E404) on npm 11, which a
+          # check cannot tell from a failed lookup. A failed lookup fails the run.
+          is_published() {
+            npm view "$1" versions --json \
+              | node -e 'const v = [].concat(JSON.parse(require("fs").readFileSync(0, "utf8"))); process.stdout.write(String(v.includes(process.argv[1])))' "$2"
+          }
+
+          if [ "${EVENT}" = "workflow_dispatch" ] || [ "${REF_TYPE}" = "tag" ]; then
+            if [ "${EVENT}" = "workflow_dispatch" ]; then VERSION="${INPUT_VERSION}"; else VERSION="${REF_NAME#v}"; fi
+            if ! [[ "${VERSION}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+              echo "::error::version must be <major>.<minor>.<patch>, got '${VERSION}'"; exit 1
+            fi
+            PG_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            EMBEDDED="$(all_servers | awk -F. -v mm="${PG_VERSION}" '($1 "." $2) == mm' | tail -n 1)"
+            if [ -z "${EMBEDDED}" ]; then
+              echo "::error::${SERVER_PKG} has no release of PostgreSQL ${PG_VERSION}"; exit 1
+            fi
+          else
+            EMBEDDED="$(all_servers | tail -n 1)"
+            if ! [[ "${EMBEDDED}" =~ ${SERVER_RE} ]]; then
+              echo "::error::unexpected ${SERVER_PKG} version '${EMBEDDED}'"; exit 1
+            fi
+            PG_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+            VERSION="${PG_VERSION}.0"
+          fi
+          if ! [[ "${EMBEDDED}" =~ ${SERVER_RE} ]]; then
+            echo "::error::unexpected ${SERVER_PKG} version '${EMBEDDED}'"; exit 1
+          fi
+
+          # Only these triggers may publish; push-main and pull_request never do.
+          case "${EVENT}/${REF_TYPE}" in
+            schedule/*|workflow_dispatch/*|push/tag) WANTS_PUBLISH=true ;;
+            *) WANTS_PUBLISH=false ;;
+          esac
+          PUBLISH=false
+          if [ "${WANTS_PUBLISH}" = true ]; then
+            PUBLISHED="$(is_published "@equin/pg-client-linux-x64" "${VERSION}")"
+            if [ "${PUBLISHED}" = false ]; then
+              PUBLISH=true
+            else
+              echo "@equin/pg-client ${VERSION} is already published: nothing to do"
+            fi
+          fi
+
+          echo "version=${VERSION} pg_version=${PG_VERSION} embedded_postgres_version=${EMBEDDED} publish=${PUBLISH}"
+          {
+            echo "version=${VERSION}"
+            echo "pg_version=${PG_VERSION}"
+            echo "embedded_postgres_version=${EMBEDDED}"
+            echo "publish=${PUBLISH}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### pg-client ${VERSION}"
+            echo "- PostgreSQL: ${PG_VERSION}"
+            echo "- server: ${SERVER_PKG}@${EMBEDDED}"
+            echo "- publish: ${PUBLISH} (${EVENT})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
     name: Build ${{ matrix.platform }}
+    needs: resolve
+    # A scheduled run with nothing new to publish stops at resolve.
+    if: github.event_name != 'schedule' || needs.resolve.outputs.publish == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -54,24 +156,33 @@ jobs:
             build-essential pkg-config curl bzip2 zlib1g-dev
 
       - name: Build
+        env:
+          PG_VERSION: ${{ needs.resolve.outputs.pg_version }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          if [ -n "${{ matrix.arch }}" ]; then
-            arch -${{ matrix.arch }} bash scripts/build.sh
+          if [ -n "${ARCH}" ]; then
+            arch "-${ARCH}" bash scripts/build.sh
           else
             bash scripts/build.sh
           fi
 
       - name: Fetch the matching embedded-postgres server
+        env:
+          EMBEDDED_POSTGRES_VERSION: ${{ needs.resolve.outputs.embedded_postgres_version }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           # --force: darwin-x64 is fetched on an arm64 runner (run under Rosetta).
           npm install --no-save --force --prefix .smoke \
-            "@embedded-postgres/${{ matrix.platform }}@${EMBEDDED_POSTGRES_VERSION}"
+            "@embedded-postgres/${PLATFORM}@${EMBEDDED_POSTGRES_VERSION}"
 
       - name: Smoke test (dump → restore against the server)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          SERVER=".smoke/node_modules/@embedded-postgres/${{ matrix.platform }}"
-          if [ -n "${{ matrix.arch }}" ]; then
-            arch -${{ matrix.arch }} bash scripts/smoke-test.sh "$SERVER"
+          SERVER=".smoke/node_modules/@embedded-postgres/${PLATFORM}"
+          if [ -n "${ARCH}" ]; then
+            arch "-${ARCH}" bash scripts/smoke-test.sh "$SERVER"
           else
             bash scripts/smoke-test.sh "$SERVER"
           fi
@@ -85,11 +196,14 @@ jobs:
 
   publish:
     name: Publish npm packages
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: publish
+      cancel-in-progress: false
     permissions:
-      contents: read
+      contents: write
       id-token: write
 
     steps:
@@ -103,43 +217,67 @@ jobs:
       - name: Upgrade npm
         run: npm install -g npm@latest
 
-      - name: Determine version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts/
 
       - name: Stage binaries and set versions
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
+          set -euo pipefail
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version '${VERSION}'"; exit 1; }
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
             mkdir -p "packages/${platform}/native/bin"
             for tool in pg_dump pg_restore; do
               cp "artifacts/pg-client-${platform}/${tool}" "packages/${platform}/native/bin/${tool}"
               chmod 755 "packages/${platform}/native/bin/${tool}"
             done
-            node -e "
-              const fs = require('fs');
-              const p = 'packages/${platform}/package.json';
-              const pkg = JSON.parse(fs.readFileSync(p, 'utf8'));
-              pkg.version = '${VERSION}';
-              fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + '\n');
-            "
+            node -e '
+              const fs = require("fs");
+              const [p, version] = process.argv.slice(1);
+              const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+              pkg.version = version;
+              fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+            ' "packages/${platform}/package.json" "${VERSION}"
           done
 
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          set -euo pipefail
+          # Whether <pkg>@<version> is on npm. Reads the package's version list:
+          # `npm view <pkg>@<missing> version` exits 1 (E404) on npm 11, which a
+          # check cannot tell from a failed lookup. A failed lookup fails the run.
+          is_published() {
+            npm view "$1" versions --json \
+              | node -e 'const v = [].concat(JSON.parse(require("fs").readFileSync(0, "utf8"))); process.stdout.write(String(v.includes(process.argv[1])))' "$2"
+          }
           for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
-            echo "==> Publishing @equin/pg-client-${platform}"
+            PKG="@equin/pg-client-${platform}"
+            # Idempotent re-run: a package an earlier attempt published is skipped.
+            if [ "$(is_published "${PKG}" "${VERSION}")" = true ]; then
+              echo "==> ${PKG}@${VERSION} is already published, skipping"
+              continue
+            fi
+            echo "==> Publishing ${PKG}@${VERSION}"
             (cd "packages/${platform}" && npm publish --provenance --access public)
           done
+
+      - name: Tag the release
+        # A tag-triggered run already has its tag. (A tag pushed with
+        # GITHUB_TOKEN does not re-trigger this workflow.)
+        if: github.ref_type != 'tag'
+        env:
+          TAG: v${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${TAG}")" ]; then
+            echo "==> ${TAG} already exists"
+            exit 0
+          fi
+          git tag "${TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${TAG}"
