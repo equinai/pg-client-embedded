@@ -245,7 +245,6 @@ jobs:
 
       - name: Publish platform packages
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           set -euo pipefail
